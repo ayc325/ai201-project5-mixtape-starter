@@ -45,6 +45,48 @@ Every model has a `to_dict()` used to serialize it directly into JSON responses 
 
 By contrast, `rate_song` (also in `notification_service.py`, invoked from `POST /songs/<song_id>/rate`) only writes/updates a `Rating` row and never calls `create_notification` — rating a song and adding it to a playlist are structurally similar "friend interacts with your shared song" actions, but only one of them currently produces a notification.
 
+```text
+Client
+  │  POST /playlists/<playlist_id>/songs
+  │  { song_id, added_by }
+  ▼
+routes/playlists.py :: add_song
+  │  parses + validates request body
+  ▼
+services/notification_service.py :: add_to_playlist(playlist_id, song_id, added_by)
+  │
+  ├─▶ look up Song, User, Playlist by ID ──▶ raise ValueError if missing ──▶ route returns 400
+  │
+  ├─▶ if song not in playlist.songs:
+  │       append via playlist_entries association
+  │       db.session.commit()            ◀── actual "add to playlist" side effect
+  │
+  └─▶ compare song.shared_by vs added_by_user_id
+          │
+          │ different user (not the original sharer)
+          ▼
+      create_notification(user_id=song.shared_by,
+                           notification_type="song_added_to_playlist",
+                           body=...)
+          │
+          ▼
+      Notification row created + committed
+          │
+          ▼
+route returns 201 { "message": "Song added to playlist" }
+
+  ⋯ later, asynchronously ⋯
+
+Recipient (song.shared_by)
+  │  GET /users/<user_id>/notifications
+  ▼
+routes/users.py :: notifications
+  ▼
+notification_service.py :: get_notifications
+  ▼
+Notification row surfaced to recipient
+```
+
 ## Patterns observed
 
 - **Routes are thin, services own all logic.** Every route handler's job is: parse the request body/query params, call exactly one service function, and translate its return value or raised `ValueError` into a JSON response (400/404 on `ValueError`, otherwise 200/201). No route touches `db.session` or a model directly except the simplest `GET /users/<id>` lookup in `routes/users.py`.
