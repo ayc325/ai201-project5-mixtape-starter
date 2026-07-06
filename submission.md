@@ -91,21 +91,21 @@ Notification row surfaced to recipient
 
 ### Issue #5 — `GET /playlists/<playlist_id>/songs` drops the last song
 
-**Root cause:** `get_playlist_songs` in `services/playlist_service.py:66` returns `[song.to_dict() for song in songs[:-1]]` instead of `songs` — the `[:-1]` slice unconditionally drops the last song from the already correctly-ordered query result, even though the docstring says it "returns all songs in the playlist."
-
-**How I reproduced it:** With the app running locally at `http://127.0.0.1:5000` (seeded via `python seed_data.py`), I picked the "Late Night Vibes" playlist (`id = b085dadd-d864-4e77-93bb-81637c3e0200`, `created_by = nova`) and compared two sources of truth for the same playlist:
+**How I reproduced it:** With the app running locally at `http://127.0.0.1:5000` (seeded via `python seed_data.py`), I picked the "Late Night Vibes" playlist (`id = b085dadd-d864-4e77-93bb-81637c3e0200`, `created_by = nova`) and compared two independent sources of truth for the same playlist:
 
 1. Queried the actual link-table state directly against the seeded database:
    `sqlite3 instance/mixtape.db "SELECT COUNT(*) FROM playlist_entries WHERE playlist_id = 'b085dadd-d864-4e77-93bb-81637c3e0200';"` → **7** rows (i.e. 7 songs genuinely linked to this playlist).
 2. Called the live endpoint for the same playlist:
    `curl http://127.0.0.1:5000/playlists/b085dadd-d864-4e77-93bb-81637c3e0200/songs` → response reported `"count": 6` and listed only 6 songs (ending at "Golden Hour"; the 7th linked song was missing entirely from the JSON).
-3. The mismatch between the DB's row count (7) and the API's reported count (6) — for a playlist that was seeded with no gaps or deletions — pinpointed the bug to the service layer's post-query filtering rather than the data itself, which traced directly to the `songs[:-1]` slice.
+3. The mismatch between the DB's row count (7) and the API's reported count (6), for a playlist seeded with no gaps or deletions, confirmed the bug was real and lived in the service/route layer rather than the data.
 
-**Fix:** Return `songs`, not `songs[:-1]`, at `services/playlist_service.py:66`.
+**How I found the root cause:** The mismatch pointed at whichever function turns the DB rows into the JSON response, so I went straight to `routes/playlists.py::get_songs`, which just calls `services/playlist_service.py::get_playlist_songs` and wraps the result — no filtering happens in the route. Reading `get_playlist_songs` top to bottom, the SQLAlchemy query itself (`.join(...).filter(...).order_by(asc(playlist_entries.c.position)).all()`) has no `LIMIT` or extra filter that would explain a missing row, so the 7 rows from the DB should already be present in `songs` at that point. The very next and only remaining line, `return [song.to_dict() for song in songs[:-1]]`, was the one place after the query where an item could be dropped — and `[:-1]` is a plain Python slice that removes exactly one item (the last), which matches the exact off-by-one (7 vs. 6) I observed. That match between the slice's known behavior and the observed discrepancy is what confirmed this line, not just the general function, as the cause.
+
+**The root cause:** `get_playlist_songs` (`services/playlist_service.py:66`) builds the correct, correctly-ordered list of songs from the database, but then discards the last element before returning it: `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice has nothing to do with pagination, deduplication, or any documented business rule — it unconditionally excludes whatever song happens to be last in position order, contradicting the function's own docstring ("returns all songs in the playlist").
+
+**My fix and side-effect check:** Changed line 66 to `return [song.to_dict() for song in songs]`, removing the slice so all queried songs are serialized. To check for side effects, I ran the full test suite (`.venv/bin/python -m pytest tests/`): `tests/test_playlists.py` (3 tests covering playlist creation and song ordering) passed, and the only failure in the full suite (`test_streak_increments_on_sunday`) is the still-unfixed Issue #1, unrelated to this change. I also re-ran the live repro curl against `/playlists/b085dadd-d864-4e77-93bb-81637c3e0200/songs` after restarting the server and confirmed `"count"` now reads `7`, matching the DB row count exactly.
 
 ### Issue #1 — listening streak wrongly resets when "yesterday" lands on a Sunday
-
-**Root cause:** In `update_listening_streak` (`services/streak_service.py:73`), the increment branch is `elif days_since_last == 1 and today.weekday() != 6: user.listening_streak += 1`. The `and today.weekday() != 6` clause carves out an undocumented exception for Sundays — the docstring only says "If the user listened yesterday: streak increments by 1," with no day-of-week exception. When `days_since_last == 1` and today is a Sunday, the condition evaluates `False`, the `elif` is skipped, and execution falls through to `else: user.listening_streak = 1`, resetting a valid consecutive-day streak instead of incrementing it.
 
 **How I reproduced it:** The real-world date at the time of testing was Sunday, 2026-07-05, so I didn't need to fake the clock — I just needed a seeded user whose `last_listened_at` was exactly one calendar day prior (Saturday, 2026-07-04).
 
@@ -116,14 +116,19 @@ Notification row surfaced to recipient
 3. Logged a new listen for nova today (Sunday) via the live endpoint:
    `curl -X POST http://127.0.0.1:5000/songs/0c36f239-0a61-46c2-8148-204b3f19b8f1/listen -H "Content-Type: application/json" -d '{"user_id": "557e9251-9ddb-43b7-a5b4-ea0e4f3a3ce9"}'`
 4. Checked the streak again: `curl http://127.0.0.1:5000/users/557e9251-9ddb-43b7-a5b4-ea0e4f3a3ce9/streak`.
-   **Expected** (per the documented rule): `8` (incremented from 7, since the gap was exactly one day).
-   **Actual:** `1` — the streak was reset, confirming the Sunday-specific `elif` condition silently defeats the increment when the triggering day happens to be a Sunday.
+   **Expected** (per the documented rule "If the user listened yesterday: streak increments by 1"): `8`.
+   **Actual:** `1` — the streak was reset instead of incremented.
 
-**Fix:** Remove the `and today.weekday() != 6` clause from the `elif` at `services/streak_service.py:73` (or otherwise resolve it, if a Sunday exception is genuinely intended — but nothing in the docstring or surrounding code suggests that it is).
+**How I found the root cause:** Since the increment happens purely server-side with no unusual input, I went to `services/streak_service.py::update_listening_streak`, the only function that touches `listening_streak`. Walking through it with nova's actual values (`days_since_last == 1`, since Saturday → Sunday is one calendar day), the code should hit the `elif days_since_last == 1: ...` branch and increment — except the branch is actually `elif days_since_last == 1 and today.weekday() != 6:`. Plugging in the reproduction's real date (Sunday, `weekday() == 6`) makes that added condition `False`, so control falls through to `else: user.listening_streak = 1`. That's the exact moment I was confident: the extra `and today.weekday() != 6` clause is the only thing in the function that isn't described anywhere in the docstring's three stated rules, and it's the only thing that changes behavior specifically on a Sunday — which is exactly the day my repro failed on. I also confirmed this wasn't a pre-existing intentional rule by checking `tests/test_streaks.py`, which has a dedicated (currently failing) test `test_streak_increments_on_sunday` asserting the increment should happen — the test file itself documents the intended behavior and currently fails for exactly this reason.
+
+**The root cause:** `update_listening_streak` (`services/streak_service.py:73`) is supposed to increment the streak whenever the gap since the last listen is exactly one calendar day. Instead of checking only `days_since_last == 1`, the condition also requires `today.weekday() != 6` (today is not a Sunday). When someone listens on consecutive days and the second day happens to be a Sunday, that added clause evaluates to `False`, so the `elif` is skipped and execution falls into the `else` branch, which resets `listening_streak` to `1` instead of incrementing it.
+
+**My fix and side-effect check:** Changed line 73 from `elif days_since_last == 1 and today.weekday() != 6:` to `elif days_since_last == 1:`, removing the day-of-week clause so the increment applies uniformly regardless of what day it lands on. Verified two ways:
+
+1. Ran `.venv/bin/python -m pytest tests/test_streaks.py -v` — all 5 tests pass, including the previously-failing `test_streak_increments_on_sunday`, while the other rules (no-prior-listen → streak starts at 1, same-day → no change, gap of more than one day → reset to 1) remain unaffected.
+2. Re-ran the live repro against the reseeded DB: nova (`user_id = de9177ca-190d-43ed-b993-d9642027b4b3`) had `last_listened_at` one calendar day before the server's current time, streak `7`. `curl http://127.0.0.1:5000/users/de9177ca-190d-43ed-b993-d9642027b4b3/streak` → `7`; `curl -X POST http://127.0.0.1:5000/songs/d5603720-3d42-4582-a577-b4b05420e3b4/listen -H "Content-Type: application/json" -d '{"user_id": "de9177ca-190d-43ed-b993-d9642027b4b3"}'`; then the streak endpoint again → `8`. (Note: by the time of this re-test the server clock had rolled from Sunday into Monday, so this specific run exercises the general "listened yesterday" path rather than the Sunday edge case — but since the fix removes the day-of-week check entirely, the increment is now correct on every day, which is exactly what `test_streak_increments_on_sunday` confirms deterministically.)
 
 ### Issue #4 — rating a song never notifies the sharer
-
-**Root cause:** `rate_song` in `services/notification_service.py:73-110` validates the score, creates or updates the `Rating` row, and commits — but never calls `create_notification`. This is structurally identical to `add_to_playlist` (same file, lines 35-70), which *does* call `create_notification(user_id=song.shared_by, ...)` after its side effect completes, and the module docstring even lists `'song_rated'` as an example `notification_type`. The call to notify the sharer was simply never added to `rate_song`.
 
 **How I reproduced it:** Using two friended seeded users — `nova` (the sharer) and `darius` (the rater) — and a song nova shared ("Still Waters," `id = 316ae5be-ca9f-4abe-bfb2-bfc93cb999a7`):
 
@@ -134,11 +139,25 @@ Notification row surfaced to recipient
 3. Checked nova's notifications again:
    `curl http://127.0.0.1:5000/users/557e9251-9ddb-43b7-a5b4-ea0e4f3a3ce9/notifications`.
    **Expected:** `count` increased by 1, with a new `song_rated`-style notification about darius's rating.
-   **Actual:** `count` was unchanged — no notification was created for nova, confirming `rate_song` silently skips the notify step that `add_to_playlist` performs for the analogous action.
+   **Actual:** `count` was unchanged — no notification was created for nova.
 
-**Fix:** Add a `create_notification(user_id=song.shared_by, notification_type="song_rated", body=...)` call in `rate_song` (guarded the same way `add_to_playlist` guards its call, so a user rating their own shared song doesn't notify themselves), mirroring the existing pattern at `services/notification_service.py:66-70`.
+**How I found the root cause:** I opened `services/notification_service.py::rate_song`, the function invoked by `POST /songs/<song_id>/rate`, and read it end to end: it validates the score, looks up the song and rater, then either updates an existing `Rating` or creates a new one, commits, and returns — there is no call to `create_notification` anywhere in the function. To be sure this was a gap and not, say, a notification path guarded behind some condition I'd missed, I compared it against `add_to_playlist` in the same file, which handles a structurally identical scenario (a friend interacting with a song someone else shared): it performs its primary side effect (appending to the playlist), then explicitly checks `song.shared_by != added_by_user_id` and calls `create_notification(...)`. `rate_song` has the equivalent primary side effect (saving the `Rating`) but no equivalent notify step at all — not a broken condition, an entirely missing call. The module docstring's mention of `'song_rated'` as an example `notification_type` (a type that appears nowhere in the actual code) confirmed this was a planned-but-unimplemented feature rather than a deliberate omission.
 
+**The root cause:** `rate_song` (`services/notification_service.py:73-110`) never calls `create_notification`. Every other "friend interacts with your shared song" action in this module (`add_to_playlist`) notifies the original sharer after its side effect completes; `rate_song` performs its side effect (creating/updating the `Rating`) but has no corresponding call to notify `song.shared_by`, so the sharer is never told their song was rated.
 
+**My fix and side-effect check:** After the `db.session.commit()` in `rate_song`, added:
+
+```python
+if song.shared_by != user_id:
+    create_notification(
+        user_id=song.shared_by, notification_type="song_rated",
+        body=f"{rater.username} rated your song '{song.title}' {score}/5."
+    )
+```
+
+mirroring `add_to_playlist`'s guard so a user rating their own shared song doesn't notify themselves.
+
+Verified against the (reseeded) live server: nova (`user_id = de9177ca-190d-43ed-b993-d9642027b4b3`) started at `count: 1` (the seeded `song_added_to_playlist` notification). After darius (`user_id = 43c43078-70f5-4ff1-b7e5-ad97b33b521a`) rated nova's "Midnight Drive" (`song_id = d5603720-3d42-4582-a577-b4b05420e3b4`) via `POST /songs/d5603720-3d42-4582-a577-b4b05420e3b4/rate`, `GET /users/de9177ca-190d-43ed-b993-d9642027b4b3/notifications` returned `count: 2`, with a new entry: `{"type": "song_rated", "body": "darius rated your song 'Midnight Drive' 3/5."}`. (First attempt showed no change because the running server process hadn't picked up the code change — restarting it resolved that and the notification then appeared as expected.) I also confirmed the existing `add_to_playlist` notification path still fires correctly (it's the older entry still present in the same response), so the fix didn't disturb that unrelated pattern.
 
 ## Patterns observed
 
