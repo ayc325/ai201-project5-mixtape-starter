@@ -179,3 +179,7 @@ Verified against the (reseeded) live server: nova (`user_id = de9177ca-190d-43ed
 - **`to_dict()` on every model is the serialization boundary.** Services return plain dicts (via `to_dict()`) wherever a route needs to jsonify a collection; single-object routes sometimes return the ORM object directly (e.g. `rate` returns `rating.to_dict()`, `listen` returns `event.to_dict()`) and Flask serializes it via `jsonify`.
 - **Cross-service imports happen locally, not at module top-level.** `notification_service.add_to_playlist` imports `Playlist` and `playlist_service.get_playlist_songs` inside the function body rather than at the top of the file, avoiding a circular import between `notification_service` and `playlist_service`.
 - **No dedicated migration tooling.** `db.create_all()` runs on every app startup in `app.py`, and `seed_data.py` is the mechanism for getting sample data in — there's no Alembic/migration directory.
+
+## Git Log
+
+![Git log](git_log.png)
