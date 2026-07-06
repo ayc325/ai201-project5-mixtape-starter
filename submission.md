@@ -1,6 +1,18 @@
-# Mixtape — Codebase Map
+# Mixtape
 
-## Main files and their responsibilities
+## AI Usage
+
+I used Claude (via Claude Code) throughout this project, mainly in three ways: understanding the codebase, generating and running reproduction steps against the live server, and documenting the root cause analysis.
+
+**Tracing data flow.** Before touching any bug, I asked it to explain how a request actually moves through the app — for example, the full path for "add a song to a playlist," from `POST /playlists/<playlist_id>/songs` through `routes/playlists.py::add_song`, into `notification_service.add_to_playlist`, and finally to where a `Notification` row gets created and later surfaced via `GET /users/<user_id>/notifications`. It laid this out as a step-by-step diagram, which is what let me see that `add_to_playlist` and `rate_song` are structurally the same kind of action ("a friend interacts with your shared song") but only one of them actually notifies the sharer — that comparison is what pointed me at Issue #4 as a real, missing-code bug rather than a stylistic quirk.
+
+**Reproducing bugs against the running server.** Once I had a suspected bug, it was genuinely useful for turning "I think this is broken" into an actual before/after test: pulling real seeded IDs out of `instance/mixtape.db` with `sqlite3`, building the exact `curl` commands with those IDs already substituted in, and telling me what response to expect versus what the bug would actually produce. This was the fastest part of the workflow — for Issue #5, comparing the `playlist_entries` row count (7) against the API's reported count (6) via curl immediately confirmed the bug was real and isolated it to the service layer, not the seed data.
+
+**Where it steered me wrong.** At one point, while writing repro steps for the Sunday streak bug, it told me to restart the server with `python app.py`. That's not how I'd been running the app — both the README and what I'd told it earlier specify `FLASK_APP=app:create_app flask run`. It should have picked up on that from context (I'd referenced the `flask run` command earlier in the session) and didn't, so I had to correct it and re-run the reproduction using the right command. Separately, more than once after I edited a service file, the AI's first instinct was to assume the fix "should" be reflected immediately — it didn't flag that the running Flask process wasn't using the reloader and needed a manual restart, so I ran into stale-code confusion (still seeing the buggy behavior after a fix) a couple of times before we figured out the server itself needed restarting.
+
+**Where I verified independently.** I didn't take any "bug confirmed" or "fix confirmed" claim at face value — every repro and every fix verification in this document was checked against an actual `curl` response, an actual `sqlite3` query against the seeded database, or an actual `pytest` run, not just the AI's description of what should happen. I also double-checked the git history operations (rewording commit messages, force-pushing) by reviewing the diffs myself before agreeing to push.
+
+## Codebase Map - Main files and their responsibilities
 
 **`app.py`** — Flask application factory. Creates the Flask app, configures the SQLAlchemy database URI (SQLite by default, overridable via `DATABASE_URL`), initializes the shared `db` object, registers the four route blueprints (`songs`, `playlists`, `users`, `feed`) under their URL prefixes, and calls `db.create_all()` on startup. This is the single entry point that wires everything else together.
 
