@@ -115,7 +115,9 @@ Notification row surfaced to recipient
 
 **The root cause:** `get_playlist_songs` (`services/playlist_service.py:66`) builds the correct, correctly-ordered list of songs from the database, but then discards the last element before returning it: `return [song.to_dict() for song in songs[:-1]]`. The `[:-1]` slice has nothing to do with pagination, deduplication, or any documented business rule — it unconditionally excludes whatever song happens to be last in position order, contradicting the function's own docstring ("returns all songs in the playlist").
 
-**My fix and side-effect check:** Changed line 66 to `return [song.to_dict() for song in songs]`, removing the slice so all queried songs are serialized. To check for side effects, I ran the full test suite (`.venv/bin/python -m pytest tests/`): `tests/test_playlists.py` (3 tests covering playlist creation and song ordering) passed, and the only failure in the full suite (`test_streak_increments_on_sunday`) is the still-unfixed Issue #1, unrelated to this change. I also re-ran the live repro curl against `/playlists/b085dadd-d864-4e77-93bb-81637c3e0200/songs` after restarting the server and confirmed `"count"` now reads `7`, matching the DB row count exactly.
+**My fix:** Changed line 66 to `return [song.to_dict() for song in songs]`, removing the slice so all queried songs are serialized.
+
+**Side-effect check:** Ran the full test suite (`.venv/bin/python -m pytest tests/`): `tests/test_playlists.py` (3 tests covering playlist creation and song ordering) passed, and the only failure in the full suite (`test_streak_increments_on_sunday`) is the still-unfixed Issue #1, unrelated to this change. I also re-ran the live repro curl against `/playlists/b085dadd-d864-4e77-93bb-81637c3e0200/songs` after restarting the server and confirmed `"count"` now reads `7`, matching the DB row count exactly.
 
 ### Issue #1 — listening streak wrongly resets when "yesterday" lands on a Sunday
 
@@ -135,7 +137,9 @@ Notification row surfaced to recipient
 
 **The root cause:** `update_listening_streak` (`services/streak_service.py:73`) is supposed to increment the streak whenever the gap since the last listen is exactly one calendar day. Instead of checking only `days_since_last == 1`, the condition also requires `today.weekday() != 6` (today is not a Sunday). When someone listens on consecutive days and the second day happens to be a Sunday, that added clause evaluates to `False`, so the `elif` is skipped and execution falls into the `else` branch, which resets `listening_streak` to `1` instead of incrementing it.
 
-**My fix and side-effect check:** Changed line 73 from `elif days_since_last == 1 and today.weekday() != 6:` to `elif days_since_last == 1:`, removing the day-of-week clause so the increment applies uniformly regardless of what day it lands on. Verified two ways:
+**My fix:** Changed line 73 from `elif days_since_last == 1 and today.weekday() != 6:` to `elif days_since_last == 1:`, removing the day-of-week clause so the increment applies uniformly regardless of what day it lands on.
+
+**Side-effect check:** Verified two ways:
 
 1. Ran `.venv/bin/python -m pytest tests/test_streaks.py -v` — all 5 tests pass, including the previously-failing `test_streak_increments_on_sunday`, while the other rules (no-prior-listen → streak starts at 1, same-day → no change, gap of more than one day → reset to 1) remain unaffected.
 2. Re-ran the live repro against the reseeded DB: nova (`user_id = de9177ca-190d-43ed-b993-d9642027b4b3`) had `last_listened_at` one calendar day before the server's current time, streak `7`. `curl http://127.0.0.1:5000/users/de9177ca-190d-43ed-b993-d9642027b4b3/streak` → `7`; `curl -X POST http://127.0.0.1:5000/songs/d5603720-3d42-4582-a577-b4b05420e3b4/listen -H "Content-Type: application/json" -d '{"user_id": "de9177ca-190d-43ed-b993-d9642027b4b3"}'`; then the streak endpoint again → `8`. (Note: by the time of this re-test the server clock had rolled from Sunday into Monday, so this specific run exercises the general "listened yesterday" path rather than the Sunday edge case — but since the fix removes the day-of-week check entirely, the increment is now correct on every day, which is exactly what `test_streak_increments_on_sunday` confirms deterministically.)
@@ -157,7 +161,7 @@ Notification row surfaced to recipient
 
 **The root cause:** `rate_song` (`services/notification_service.py:73-110`) never calls `create_notification`. Every other "friend interacts with your shared song" action in this module (`add_to_playlist`) notifies the original sharer after its side effect completes; `rate_song` performs its side effect (creating/updating the `Rating`) but has no corresponding call to notify `song.shared_by`, so the sharer is never told their song was rated.
 
-**My fix and side-effect check:** After the `db.session.commit()` in `rate_song`, added:
+**My fix:** After the `db.session.commit()` in `rate_song`, added:
 
 ```python
 if song.shared_by != user_id:
@@ -169,7 +173,7 @@ if song.shared_by != user_id:
 
 mirroring `add_to_playlist`'s guard so a user rating their own shared song doesn't notify themselves.
 
-Verified against the (reseeded) live server: nova (`user_id = de9177ca-190d-43ed-b993-d9642027b4b3`) started at `count: 1` (the seeded `song_added_to_playlist` notification). After darius (`user_id = 43c43078-70f5-4ff1-b7e5-ad97b33b521a`) rated nova's "Midnight Drive" (`song_id = d5603720-3d42-4582-a577-b4b05420e3b4`) via `POST /songs/d5603720-3d42-4582-a577-b4b05420e3b4/rate`, `GET /users/de9177ca-190d-43ed-b993-d9642027b4b3/notifications` returned `count: 2`, with a new entry: `{"type": "song_rated", "body": "darius rated your song 'Midnight Drive' 3/5."}`. (First attempt showed no change because the running server process hadn't picked up the code change — restarting it resolved that and the notification then appeared as expected.) I also confirmed the existing `add_to_playlist` notification path still fires correctly (it's the older entry still present in the same response), so the fix didn't disturb that unrelated pattern.
+**Side-effect check:** Verified against the (reseeded) live server: nova (`user_id = de9177ca-190d-43ed-b993-d9642027b4b3`) started at `count: 1` (the seeded `song_added_to_playlist` notification). After darius (`user_id = 43c43078-70f5-4ff1-b7e5-ad97b33b521a`) rated nova's "Midnight Drive" (`song_id = d5603720-3d42-4582-a577-b4b05420e3b4`) via `POST /songs/d5603720-3d42-4582-a577-b4b05420e3b4/rate`, `GET /users/de9177ca-190d-43ed-b993-d9642027b4b3/notifications` returned `count: 2`, with a new entry: `{"type": "song_rated", "body": "darius rated your song 'Midnight Drive' 3/5."}`. (First attempt showed no change because the running server process hadn't picked up the code change — restarting it resolved that and the notification then appeared as expected.) I also confirmed the existing `add_to_playlist` notification path still fires correctly (it's the older entry still present in the same response), so the fix didn't disturb that unrelated pattern.
 
 ## Patterns observed
 
